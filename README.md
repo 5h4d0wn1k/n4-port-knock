@@ -1,140 +1,82 @@
 # N4 — Port Knocking Client/Server
 
-Covert port access via SYN knock sequences for authorized security testing.
+Covert access to a hidden port via a pre-defined knock sequence. The default
+`listen` transport is plain TCP over localhost (unprivileged, deterministic);
+a raw-socket SYN watcher is available behind `--live` for real interfaces.
 
 ## Overview
 
-This project implements a port knocking system that provides covert access to hidden services. Port knocking is a security mechanism where a closed port is opened after receiving a pre-defined sequence of connection attempts (knocks) to specific ports.
+This project implements a port knocking system that grants access to a secret
+port only after receiving the correct sequence of TCP connection attempts. It
+is intended for authorized own-lab testing of network access control design.
 
-**Use cases:**
-- Hidden SSH/TCP service access
-- Covert channel establishment
-- Network access control research
-- Security hardening validation
+**Two server transports:**
+- `listen` (default): real TCP listeners on the knock ports and the secret
+  port. Works end-to-end over 127.0.0.1 with no privileges — this is what the
+  selftest and unit tests exercise.
+- `raw` (`--live`): raw-socket SYN watcher on a real interface (root only).
 
-## Features
+## What Works
 
-- **SYN Knock Sequence**: Sends TCP SYN packets to pre-defined ports
-- **HMAC Authentication**: Optional HMAC-based sequence verification
-- **Timing Stealth**: Random delays between knocks
-- **Client/Server Architecture**: Complete client and server implementations
-- **Statistics Tracking**: Monitor knock attempts and successes
-
-## Architecture
-
-```
-Client                    Server
-  |                         |
-  |-- SYN:7000 ----------->|
-  |-- SYN:8000 ----------->|
-  |-- SYN:9000 ----------->|
-  |<-- [Port 8080 Opens] --|
-  |<-- Connection OK ------|
-```
-
-## Installation
-
-```bash
-# Clone and install
-git clone https://github.com/yourorg/n4-port-knock.git
-cd n4-port-knock/firmware
-pip install -r requirements.txt
-
-# Or install directly
-pip install pycryptodome
-```
-
-### Dependencies
-
-```bash
-pip install pycryptodome
-```
+- **Sequence state machine** (`KnockGate`) — per-source-IP validation with
+  attempts counter and grant timeout; shared by both transports.
+- **Listener server** (`ListenerKnockServer`) — grants the secret port
+  (banner `OK-AUTH`) only after the full knock sequence; answers `DENIED`
+  before it. Acks each knock so the client never races the server.
+- **Real localhost end-to-end** (`selftest`) — client knocks via genuine TCP
+  connects against 127.0.0.1 and proves the secret port was gated, then opened.
+- **Raw live watcher** (`RawKnockWatcher`, `--live`) — parses real SYN packets.
 
 ## Usage
 
-### Server
+```bash
+# Deterministic localhost end-to-end selftest (no privileges)
+python3 knock_server.py selftest
+
+# Run a listen-mode server explicitly
+python3 knock_server.py server --sequence 7000,8000,9000 --port 8443
+
+# Knock from a client, then probe the secret port
+python3 knock_client.py 127.0.0.1 --sequence 7000,8000,9000 --secret-port 8443
+
+# Live raw-socket SYN watcher (root): explicit --live required
+sudo python3 knock_server.py server --live --transport raw \
+      --sequence 7000,8000,9000
+```
+
+## Tests
 
 ```bash
-# Start knock server on all interfaces
-sudo python3 knock_server.py server --port 8080
-
-# Custom knock sequence
-sudo python3 knock_server.py server --sequence 1000,2000,3000
-
-# With authentication timeout
-sudo python3 knock_server.py server --timeout 15 --max-attempts 5
+python3 -m unittest discover -s tests
 ```
 
-### Client
+## Live Lab Test Plan
 
-```bash
-# Basic knock
-python3 knock_client.py 192.168.1.100
+> Authorized own-lab use only. Use documented placeholders (192.0.2.x, 00:11:22:33:44:55).
 
-# Custom sequence
-python3 knock_client.py 192.168.1.100 --sequence 1000,2000,3000
+1. Run `python3 knock_server.py server --sequence 7000,8000,9000 --port 22` on the
+   lab target (or `server --live --transport raw` for a real SYN watcher).
+2. From the lab client run `python3 knock_client.py 192.0.2.10 --sequence 7000,8000,9000 --secret-port 22`.
+3. Confirm the server logs `[AUTH]` and the client receives `OK-AUTH`.
+4. Probe the secret port **before** knocking and confirm the answer is `DENIED`.
+5. Drive a wrong-sequence client and confirm `[BLOCK]`-style behaviour (attempt
+   counter increments, no grant).
 
-# With secret port probe
-python3 knock_client.py 192.168.1.100 --secret-port 8080
+## Metrics
 
-# With verbose output
-python3 knock_client.py 192.168.1.100 -v
-```
+Core offline harness (localhost, no privileges) is deterministic and unit-tested:
 
-### Example Output
-
-```
-=== N4 — Port Knocking Client ===
-Target: 192.168.1.100
-Sequence: [7000, 8000, 9000]
-Delay: 0.5s
-[SENT] Port 7000 (1/3)
-[SENT] Port 8000 (2/3)
-[SENT] Port 9000 (3/3)
-[DONE] 3 knocks sent
-[ACCESS] Connection attempt result: Connection refused
-```
-
-## Command Reference
-
-### `server` Command
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--interface` | Bind address | 0.0.0.0 |
-| `--port` | Secret port | 8080 |
-| `--sequence` | Knock sequence | 7000,8000,9000 |
-| `--timeout` | Auth timeout (s) | 10 |
-| `--max-attempts` | Max failed attempts | 3 |
-
-### `client` Command
-| Flag | Description | Default |
-|------|-------------|---------|
-| `target` | Target IP | (required) |
-| `--sequence` | Knock sequence | 7000,8000,9000 |
-| `--delay` | Inter-knock delay (s) | 0.5 |
-| `--secret-port` | Port to probe | (none) |
-| `--retries` | Connection retries | 3 |
-
-## How It Works
-
-1. **Knock Phase**: Client sends SYN packets to each port in sequence
-2. **Validation**: Server tracks incoming SYNs and validates sequence
-3. **Access Grant**: Upon valid sequence, server opens secret port
-4. **Connection**: Client connects to newly opened port
-5. **Session Expiry**: Access expires after timeout period
-
-## Security Considerations
-
-- SYN packets can be logged by IDS/IPS systems
-- Timing analysis may detect knock sequences
-- Use HMAC-verified sequences for stronger authentication
-- Consider rate limiting on server side
+- Sequence state machine (correct/wrong order/unknown port/timeout): PASS (5 tests)
+- End-to-end: denied before knock, `OK-AUTH` after knock over real TCP: PASS
+- Wrong sequence keeps the port closed: PASS
+- Grant window expiry re-closes the port: PASS (9 tests total)
+- Exit code: `0` on successful selftest, `1` on failure
 
 ## Legal Disclaimer
 
 **IMPORTANT: Read before use.**
 
-This project is provided for **educational and authorized security testing purposes only**. 
+This project is provided for **educational and authorized security testing purposes only**.
 
 ### Authorization Requirements
 - You MUST have explicit written permission from the network owner before using this tool

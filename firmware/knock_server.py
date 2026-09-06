@@ -1,276 +1,370 @@
 #!/usr/bin/env python3
 """
-N4 — Port Knocking Server
-Covert port access via SYN knock sequences.
-"""
+N4 - Port Knocking Client/Server
+Covert port access via knock sequences.
 
+Two transports for the server:
+  - `listen` (DEFAULT): plain TCP listeners on the knock ports and the secret
+    port. Client knocks open an actual TCP connection on each knock port; the
+    server only grants the secret port after the full sequence. Runs
+    unprivileged and deterministically over localhost - this is the path used
+    by the offline harness and the unit tests.
+  - `raw` (gated behind --live): real raw-socket SYN watcher on a network
+    interface. Requires root and a genuine packet path.
+
+The state machine (KnockGate) is shared by both transports, so the offline
+harness exercises exactly the same core code as live mode.
+"""
 import argparse
 import logging
+import select
 import socket
 import struct
 import sys
 import threading
 import time
-from collections import defaultdict
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s [%(levelname)s] %(message)s',
+                    datefmt='%H:%M:%S')
 log = logging.getLogger('knock-server')
 
 
-class KnockServer:
-    def __init__(self, interface='0.0.0.0', secret_port=8080,
-                 knock_sequence=None, timeout=10, max_attempts=3):
-        self.interface = interface
-        self.secret_port = secret_port
-        self.knock_sequence = knock_sequence or [7000, 8000, 9000]
+class KnockGate:
+    """Per-source-IP knock sequence state machine."""
+
+    def __init__(self, knock_sequence=None, timeout=10, max_attempts=3):
+        self.knock_sequence = list(knock_sequence or [7000, 8000, 9000])
         self.timeout = timeout
         self.max_attempts = max_attempts
-        self.authenticated_hosts = {}
-        self.knock_log = []
+        self._state = {}          # src_ip -> dict
         self._lock = threading.Lock()
-        self._running = False
-        self.stats = {
-            'total_knocks': 0,
-            'successful': 0,
-            'failed': 0,
-            'active_sessions': 0
-        }
+        self.stats = {'total_knocks': 0, 'successful': 0, 'failed': 0}
 
-    def _validate_knock(self, src_ip, ports):
-        """Validate knock sequence from a host."""
+    def _entry(self, src_ip):
+        if src_ip not in self._state:
+            self._state[src_ip] = {
+                'ports': [], 'attempts': 0, 'timestamp': None,
+                'authenticated': False,
+            }
+        return self._state[src_ip]
+
+    def handle(self, src_ip, port):
+        """Record a knock event; returns True when the full sequence matched.
+
+        Ports must arrive in the configured order; any mismatch resets the
+        pending sequence for that source.
+        """
         with self._lock:
-            if src_ip not in self.authenticated_hosts:
-                self.authenticated_hosts[src_ip] = {
-                    'ports': [],
-                    'attempts': 0,
-                    'timestamp': None,
-                    'authenticated': False
-                }
-
-            entry = self.authenticated_hosts[src_ip]
+            self.stats['total_knocks'] += 1
+            if port == self.knock_sequence[-1] + 1:
+                # Secret port is not a knock port; ignore knocks aimed at it.
+                return self.is_authenticated(src_ip)
+            if port not in self.knock_sequence:
+                entry = self._entry(src_ip)
+                entry['ports'] = []
+                entry['attempts'] += 1
+                self.stats['failed'] += 1
+                return False
+            entry = self._entry(src_ip)
 
             if entry['authenticated']:
-                if time.time() - entry['timestamp'] < self.timeout:
+                if time.time() - (entry['timestamp'] or 0) < self.timeout:
                     return True
                 entry['authenticated'] = False
                 entry['ports'] = []
 
-            for port in ports:
-                if len(entry['ports']) < len(self.knock_sequence):
-                    expected = self.knock_sequence[len(entry['ports'])]
-                    if port == expected:
-                        entry['ports'].append(port)
-                        entry['timestamp'] = time.time()
-                        log.info(
-                            f"[KNOCK] {src_ip} -> port {port} "
-                            f"({len(entry['ports'])}/{len(self.knock_sequence)})"
-                        )
-                    else:
-                        entry['ports'] = []
-                        entry['attempts'] += 1
-                        if entry['attempts'] >= self.max_attempts:
-                            log.warning(
-                                f"[BLOCK] {src_ip} exceeded max attempts"
-                            )
-                        return False
+            expected = self.knock_sequence[len(entry['ports'])]
+            if port != expected:
+                entry['ports'] = []
+                entry['attempts'] += 1
+                self.stats['failed'] += 1
+                return False
+
+            entry['ports'].append(port)
+            entry['timestamp'] = time.time()
+            log.info('[KNOCK] %s -> port %s (%s/%s)', src_ip, port,
+                     len(entry['ports']), len(self.knock_sequence))
 
             if entry['ports'] == self.knock_sequence:
                 entry['authenticated'] = True
                 entry['attempts'] = 0
                 self.stats['successful'] += 1
-                log.info(f"[AUTH] {src_ip} authenticated")
-                self._log_event(src_ip, 'SUCCESS')
+                log.info('[AUTH] %s authenticated', src_ip)
                 return True
+            return False
 
-        return False
+    def is_authenticated(self, src_ip):
+        with self._lock:
+            entry = self._entry(src_ip)
+            if not entry['authenticated']:
+                return False
+            if time.time() - (entry['timestamp'] or 0) >= self.timeout:
+                entry['authenticated'] = False
+                entry['ports'] = []
+                return False
+            return True
 
-    def _log_event(self, src_ip, event):
-        self.knock_log.append({
-            'timestamp': time.time(),
-            'src_ip': src_ip,
-            'event': event
-        })
+    def reset(self):
+        with self._lock:
+            self._state.clear()
+            self.stats = {'total_knocks': 0, 'successful': 0, 'failed': 0}
 
-    def _handle_syn(self, packet):
-        """Process incoming SYN packet."""
-        try:
-            src_ip = packet[0][0]
-            dst_port = packet[0][1]
-            self.stats['total_knocks'] += 1
 
-            if dst_port == self.secret_port:
-                return
+class ListenerKnockServer:
+    """Plain-TCP knock server for unprivileged localhost demos/tests.
 
-            if dst_port in self.knock_sequence:
-                authenticated = self._validate_knock(src_ip, [dst_port])
-                if authenticated:
-                    log.info(
-                        f"[OPEN] Granting access to {src_ip} "
-                        f"on port {self.secret_port}"
-                    )
-        except Exception as e:
-            log.debug(f"Packet parse error: {e}")
+    Listens on each knock port: an inbound connect() is the knock. Listens on
+    the secret port too: connections are answered DENIED until the sequence
+    completes, then OK-AUTH.
+    """
+
+    def __init__(self, host='127.0.0.1', secret_port=0, knock_sequence=None,
+                 timeout=10, max_attempts=3, banner=b'OK-AUTH\n',
+                 denied=b'DENIED\n'):
+        self.host = host
+        self.secret_port = secret_port
+        self.knock_sequence = list(knock_sequence or [7000, 8000, 9000])
+        self.banner = banner
+        self.denied = denied
+        self.gate = KnockGate(self.knock_sequence, timeout, max_attempts)
+        self._socks = []
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self.knock_ports = []
+        self.granted = 0
+        self.denied_count = 0
 
     def start(self):
-        """Start the knock server using raw sockets."""
-        self._running = True
-        log.info("=== N4 — Port Knocking Server ===")
-        log.info(f"Knock sequence: {self.knock_sequence}")
-        log.info(f"Secret port: {self.secret_port}")
-        log.info(f"Timeout: {self.timeout}s")
+        """Bind all knock ports + the secret port; return bound ports."""
+        secret = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        secret.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        secret.bind((self.host, self.secret_port))
+        secret.listen(64)
+        self.secret_port = secret.getsockname()[1]
+        self._socks.append((None, secret))
 
+        for port in self.knock_sequence:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, port))
+            s.listen(64)
+            self._socks.append((port, s))
+        self.knock_ports = [s.getsockname()[1] for _, s in self._socks
+                            if _ is not None]
+        return self.knock_ports, self.secret_port
+
+    def serve(self):
+        """Accept-loop until stop(); run in a thread."""
+        self._running = True
+        while self._running:
+            try:
+                ready, _, _ = select.select([s for _, s in self._socks],
+                                            [], [], 0.2)
+                for s in ready:
+                    conn, addr = s.accept()
+                    with self._lock:
+                        port = s.getsockname()[1]
+                        if port == self.secret_port:
+                            if self.gate.is_authenticated(addr[0]):
+                                self.granted += 1
+                                conn.sendall(self.banner)
+                            else:
+                                self.denied_count += 1
+                                conn.sendall(self.denied)
+                        else:
+                            self.gate.handle(addr[0], port)
+                            # Ack the knock so the client knows it was
+                            # processed before moving to the next port.
+                            conn.sendall(b'K')
+                    conn.close()
+            except OSError:
+                break
+            except socket.error:
+                break
+
+    def start_background(self):
+        self._thread = threading.Thread(target=self.serve, daemon=True)
+        self._thread.start()
+        return self._thread
+
+    def stop(self):
+        self._running = False
+        for _, s in self._socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2)
+
+
+class RawKnockWatcher:
+    """Live raw-socket SYN watcher (root only). Gated behind --live."""
+
+    def __init__(self, knock_sequence=None, timeout=10, max_attempts=3):
+        self.gate = KnockGate(knock_sequence, timeout, max_attempts)
+        self._running = False
+
+    def run(self):
+        self._running = True
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                  socket.IPPROTO_TCP)
             sock.settimeout(1.0)
         except PermissionError:
-            log.error("Requires root privileges (raw sockets)")
-            sys.exit(1)
-
-        log.info("Listening for knock packets...")
-
+            log.error('ERROR: live raw-socket mode requires root.')
+            return 1
+        log.info('Listening for knock packets (raw)...')
         try:
             while self._running:
                 try:
-                    data, addr = sock.recvfrom(65535)
-                    ip_header = struct.unpack('!BBHHHBBH4s4s', data[:20])
-                    protocol = ip_header[6]
-
-                    if protocol == 6:
-                        tcp_header = struct.unpack(
-                            '!HHLLBBHHH',
-                            data[20:40]
-                        )
-                        src_port = tcp_header[0]
-                        dst_port = tcp_header[1]
-                        flags = tcp_header[5]
-                        src_ip = socket.inet_ntoa(ip_header[8])
-
-                        if flags & 0x02:
-                            self._handle_syn(
-                                ((src_ip, dst_port),)
-                            )
+                    data, _ = sock.recvfrom(65535)
+                    if len(data) < 40:
+                        continue
+                    ip_fields = struct.unpack('!BBHHHBBH4s4s', data[:20])
+                    if ip_fields[6] != 6:  # TCP
+                        continue
+                    tcp_fields = struct.unpack('!HHLLBBHHH', data[20:40])
+                    if not (tcp_fields[5] & 0x02):  # SYN flag
+                        continue
+                    src_ip = socket.inet_ntoa(ip_fields[8])
+                    dst_port = tcp_fields[1]
+                    self.gate.handle(src_ip, dst_port)
                 except socket.timeout:
                     continue
-                except KeyboardInterrupt:
-                    break
         finally:
             sock.close()
-            self._running = False
-            self._print_stats()
+        return 0
 
     def stop(self):
         self._running = False
 
-    def _print_stats(self):
-        log.info("\n=== Statistics ===")
-        log.info(f"Total knocks:    {self.stats['total_knocks']}")
-        log.info(f"Successful auth: {self.stats['successful']}")
-        log.info(f"Failed attempts: {self.stats['failed']}")
 
+def run_selftest(host='127.0.0.1', delay=0.0):
+    """Deterministic localhost end-to-end: knock -> secret port opens."""
+    import knock_client
+    server = ListenerKnockServer(host=host, secret_port=0,
+                                 knock_sequence=[7001, 8001, 9001],
+                                 timeout=10)
+    server.start()
+    server.start_background()
+    try:
+        client = knock_client.KnockClient(host, delay=delay)
+        print('=== N4 Port Knock: localhost end-to-end selftest ===')
 
-class KnockClient:
-    def __init__(self, target, sequence=None, delay=0.5):
-        self.target = target
-        self.sequence = sequence or [7000, 8000, 9000]
-        self.delay = delay
+        # 1. Secret port must be denied BEFORE the sequence.
+        before = client.probe_secret(server.secret_port)
+        print(f'[gated before knock] banner={before!r} '
+              f'(expect DENIED)')
+        denied_ok = before is not None and b'DENIED' in before
 
-    def send_knock(self):
-        """Send SYN knock sequence to target."""
-        log.info(f"=== N4 — Port Knocking Client ===")
-        log.info(f"Target: {self.target}")
-        log.info(f"Sequence: {self.sequence}")
+        # 2. Knock the sequence (real TCP connects on localhost).
+        client.send_sequence_to(server.knock_ports)
 
-        for i, port in enumerate(self.sequence):
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.1)
-                result = sock.connect_ex((self.target, port))
-                sock.close()
-                log.info(
-                    f"[KNOCK] Sent SYN to port {port} "
-                    f"({i + 1}/{len(self.sequence)})"
-                )
-            except Exception as e:
-                log.debug(f"Knock to {port}: {e}")
+        # 3. Secret port now answers with the AUTH banner.
+        after = client.probe_secret(server.secret_port)
+        print(f'[opened after knock] banner={after!r} '
+              f'(expect OK-AUTH)')
+        opened_ok = after is not None and b'OK-AUTH' in after
 
-            if i < len(self.sequence) - 1:
-                time.sleep(self.delay)
+        print('\n=== Stats ===')
+        print(f'  knocks observed: {server.gate.stats["total_knocks"]}')
+        print(f'  auths granted:   {server.gate.stats["successful"]}')
+        print(f'  grants served:   {server.granted}')
 
-        log.info("[DONE] Knock sequence sent")
-        time.sleep(1)
-
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((self.target, self.sequence[-1] + 1))
-            log.info("[ACCESS] Connection established")
-            sock.close()
-            return True
-        except (ConnectionRefusedError, socket.timeout, OSError) as e:
-            log.info(f"[ACCESS] Connection attempt result: {e}")
-            return False
+        ok = denied_ok and opened_ok and server.granted >= 1
+        print('\n[RESULT] ' + ('PASS' if ok else 'FAIL'))
+        return 0 if ok else 1
+    finally:
+        server.stop()
 
 
 def cmd_server(args):
-    server = KnockServer(
-        interface=args.interface,
-        secret_port=args.port,
+    if args.transport == 'raw':
+        watcher = RawKnockWatcher(
+            [int(p) for p in args.sequence.split(',')],
+            timeout=args.timeout, max_attempts=args.max_attempts)
+        sys.exit(watcher.run())
+    server = ListenerKnockServer(
+        host=args.interface, secret_port=args.port,
         knock_sequence=[int(p) for p in args.sequence.split(',')],
-        timeout=args.timeout,
-        max_attempts=args.max_attempts
-    )
+        timeout=args.timeout, max_attempts=args.max_attempts)
     server.start()
+    print(f'=== N4 Port Knock server (listen) ===')
+    print(f'  host:    {server.host}')
+    print(f'  knocks:  {server.knock_ports}')
+    print(f'  secret:  {server.secret_port}')
+    server.serve()
 
 
 def cmd_client(args):
-    client = KnockClient(
-        target=args.target,
-        sequence=[int(p) for p in args.sequence.split(',')],
-        delay=args.delay
-    )
-    client.send_knock()
+    import knock_client
+    client = knock_client.KnockClient(
+        args.target, sequence=[int(p) for p in args.sequence.split(',')],
+        delay=args.delay)
+    client.send_sequence()
+    if args.secret_port:
+        res = client.probe_secret(args.secret_port)
+        print(f'[probe] {res!r}')
+    client.print_stats()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description='N4 — Port Knocking Client/Server',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    subparsers = parser.add_subparsers(dest='command', help='Command')
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command')
 
-    srv = subparsers.add_parser('server', help='Start knock server')
-    srv.add_argument('--interface', default='0.0.0.0',
-                     help='Bind address (default: 0.0.0.0)')
-    srv.add_argument('--port', type=int, default=8080,
-                     help='Secret port (default: 8080)')
+    srv = sub.add_parser('server', help='Start knock server')
+    srv.add_argument('--transport', choices=['listen', 'raw'], default='listen',
+                     help='listen=plain TCP (default, unprivileged); '
+                          'raw=raw-socket SYNs (--live, root)')
+    srv.add_argument('--live', action='store_true',
+                     help='Enable the raw-socket transport (requires root)')
+    srv.add_argument('--interface', default='127.0.0.1',
+                     help='Bind address (default: 127.0.0.1)')
+    srv.add_argument('--iface', dest='interface',
+                     help='Alias for --interface')
+    srv.add_argument('--port', type=int, default=0,
+                     help='Secret port (default: ephemeral)')
     srv.add_argument('--sequence', default='7000,8000,9000',
                      help='Knock sequence (default: 7000,8000,9000)')
-    srv.add_argument('--timeout', type=int, default=10,
-                     help='Auth timeout in seconds (default: 10)')
-    srv.add_argument('--max-attempts', type=int, default=3,
-                     help='Max failed attempts (default: 3)')
-    srv.set_defaults(func=cmd_server)
+    srv.add_argument('--timeout', type=int, default=10)
+    srv.add_argument('--max-attempts', type=int, default=3)
 
-    cli = subparsers.add_parser('client', help='Send knock sequence')
+    cli = sub.add_parser('client', help='Send knock sequence')
     cli.add_argument('target', help='Target IP address')
     cli.add_argument('--sequence', default='7000,8000,9000',
                      help='Knock sequence (default: 7000,8000,9000)')
-    cli.add_argument('--delay', type=float, default=0.5,
-                     help='Delay between knocks (default: 0.5)')
-    cli.set_defaults(func=cmd_client)
+    cli.add_argument('--secret-port', type=int, default=None,
+                     help='Probe this secret port after knocking')
+    cli.add_argument('--delay', type=float, default=0.2)
 
-    args = parser.parse_args()
+    st = sub.add_parser('selftest', help='Localhost end-to-end test')
+    st.add_argument('--host', default='127.0.0.1')
+
+    args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
-        sys.exit(1)
+        return 0
 
-    args.func(args)
+    if args.command == 'selftest':
+        return run_selftest(host=args.host)
+
+    if args.command == 'server':
+        if args.transport == 'listen':
+            return cmd_server(args)
+        if not args.live:
+            print('ERROR: raw transport requires --live (root). '
+                  'Use listen transport for localhost demos.')
+            return 1
+        return cmd_server(args)
+    if args.command == 'client':
+        cmd_client(args)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -34,20 +34,41 @@ class KnockClient:
         }
 
     def _send_syn(self, port):
-        """Send a single SYN packet."""
+        """Send a single SYN knock.
+
+        A real TCP connect() is attempted. Against the listen-mode server the
+        connection is accepted and acknowledged ('K') so knock order is
+        deterministic; against a raw-mode (closed port) server the SYN is still
+        emitted and connect failure just counts as a sent knock.
+        """
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(0.5)
-            result = sock.connect_ex((self.target, port))
+            sock.connect((self.target, port))
+            try:
+                sock.recv(1)  # listen-mode ack; raw mode returns ''/timeout
+            except socket.timeout:
+                pass
             sock.close()
+            self.stats['knocks_sent'] += 1
+            return True
+        except (ConnectionRefusedError, OSError):
             self.stats['knocks_sent'] += 1
             return True
         except Exception as e:
             log.debug(f"SYN to {port} failed: {e}")
             return False
 
+    def send_sequence_to(self, ports):
+        """Knock a specific list of ports (used by selftest/tests)."""
+        for i, port in enumerate(ports):
+            self._send_syn(port)
+            if i < len(ports) - 1 and self.delay:
+                time.sleep(self.delay)
+        return self.stats['knocks_sent']
+
     def send_sequence(self):
-        """Send the full knock sequence."""
+        """Send the full configured knock sequence."""
         log.info(f"Target: {self.target}")
         log.info(f"Sequence: {self.sequence}")
         log.info(f"Delay: {self.delay}s")
@@ -59,36 +80,44 @@ class KnockClient:
                 f"[{status}] Port {port} "
                 f"({i + 1}/{len(self.sequence)})"
             )
-            if i < len(self.sequence) - 1:
+            if i < len(self.sequence) - 1 and self.delay:
                 time.sleep(self.delay)
 
         log.info(f"[DONE] {self.stats['knocks_sent']} knocks sent")
+        return self.stats['knocks_sent']
 
-    def probe_secret(self):
-        """Attempt to connect to the secret port after knocking."""
-        if not self.secret_port:
-            return False
+    def probe_secret(self, secret_port):
+        """Connect to the secret port; return the server's banner bytes.
 
+        Returns the raw banner (e.g. b'DENIED' before the knock, b'OK-AUTH'
+        after) or None if the port refused/timed out.
+        """
+        self.secret_port = secret_port
         log.info(f"Probing secret port {self.secret_port}...")
         for attempt in range(self.retries):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(3)
                 sock.connect((self.target, self.secret_port))
-                log.info("[CONNECTED] Secret port is open!")
+                banner = sock.recv(128)
                 sock.close()
                 self.stats['connections_successful'] += 1
-                return True
-            except (ConnectionRefusedError, socket.timeout) as e:
-                log.info(
-                    f"[ATTEMPT {attempt + 1}] "
-                    f"Connection refused: {e}"
-                )
+                return banner
+            except ConnectionRefusedError:
                 self.stats['connections_attempted'] += 1
-                time.sleep(1)
+                log.info(
+                    f"[ATTEMPT {attempt + 1}] Connection refused"
+                )
+                time.sleep(0.1)
+            except socket.timeout:
+                self.stats['connections_attempted'] += 1
+                log.info(
+                    f"[ATTEMPT {attempt + 1}] Timed out connecting"
+                )
+                time.sleep(0.1)
 
         log.info("[FAILED] Could not connect to secret port")
-        return False
+        return None
 
     def print_stats(self):
         log.info("\n=== Statistics ===")
@@ -140,7 +169,9 @@ Examples:
     client.send_sequence()
 
     if args.secret_port:
-        client.probe_secret()
+        banner = client.probe_secret(args.secret_port)
+        if banner is not None:
+            log.info(f"Secret port banner: {banner!r}")
 
     client.print_stats()
 
